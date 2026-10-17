@@ -1,13 +1,12 @@
 """
-🐄 Bovine SNP Platform v6.3 — Version complète et corrigée
-Corrections : detect_roh (json.loads), code complet, gt_snp strict
-Nouveautés  : Groupes de races, signatures par groupe, GWAS 10 cM
+🐄 Bovine SNP Platform v6.2 — Version finale et complète
+Corrections : detect_roh (json.loads), Axiom, code complet
+Fonctionnalités : QC · LD · Structure · Admixture · Démographie ·
+                  Sélection · Phylogénie · Binômes (5 modes) ·
+                  Signatures par population · Signatures par groupes ·
+                  Groupe A vs B · Annotation GTF · GWAS 10 cM · Export
 """
-import gzip
-import json
-import os
-import warnings
-import zipfile
+import gzip, json, os, warnings, zipfile
 from collections import Counter
 from datetime import datetime
 from io import BytesIO
@@ -19,18 +18,18 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
-from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.distance import squareform
 from sklearn.decomposition import NMF, PCA
 from sklearn.manifold import MDS as SklearnMDS
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-st.set_page_config(page_title="🐄 Bovine SNP v6.3", page_icon="🐄",
+st.set_page_config(page_title="🐄 Bovine SNP v6.2", page_icon="🐄",
                     layout="wide", initial_sidebar_state="expanded")
 
 DEFAULTS = {"geno": 0.05, "mind": 0.05, "maf": 0.05,
             "hwe": 1e-6, "het_sd": 3.0, "king": 0.354, "ld_r2": 0.2}
-
+HWE_EXACT_MAX = 20_000
 ARS_LEN = {"1": 158_534_110, "2": 136_231_102, "3": 121_005_158,
             "4": 120_000_166, "5": 120_089_699, "6": 117_806_340,
             "7": 110_682_743, "8": 113_384_748, "9": 105_708_134,
@@ -43,6 +42,8 @@ ARS_LEN = {"1": 158_534_110, "2": 136_231_102, "3": 121_005_158,
             "28": 46_333_854, "29": 51_319_414}
 AUTOSOMES = [str(i) for i in range(1, 30)]
 DEFAULT_GROUPS = {"Laitier": [], "Viande": [], "Cornu": [], "Rustique": []}
+RACE_POOL = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
+             "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"]
 
 
 # ==================== CACHE ====================
@@ -58,7 +59,7 @@ HASH_FUNCS = {np.ndarray: _hash_np}
 def cached(fn=None, **kw):
     def wrap(f):
         return st.cache_data(show_spinner=False,
-                             hash_funcs=HASH_FUNCS, **kw)(f)
+                              hash_funcs=HASH_FUNCS, **kw)(f)
     return wrap(fn) if fn else wrap
 
 
@@ -77,11 +78,11 @@ def impute(gt):
 
 
 def _chr_key(c):
-    s = str(c).upper().replace("CHR", "")
-    if s.isdigit():
-        return (0, int(s))
+    s = str(c).upper().replace("CHR", "").replace("CHROMOSOME", "")
+    if s.isdigit(): return (0, int(s), "")
     sp = {"X": 100, "Y": 101, "MT": 102, "M": 102}
-    return (1, sp.get(s, 999))
+    if s in sp: return (1, sp[s], "")
+    return (2, 0, s)
 
 
 def _auto_weights():
@@ -91,14 +92,12 @@ def _auto_weights():
 
 def step_header(n, t, q, w, a):
     with st.expander(f"📖 Étape {n} — {t}", expanded=False):
-        st.markdown(f"**🎯 {q}**\n\n**❓ Pourquoi :** {w}\n\n"
-                    f"**✅ Attendu :** {a}")
+        st.markdown(f"**🎯 {q}**\n\n**❓ {w}**\n\n**✅ {a}**")
 
 
 # ==================== CONVERTISSEUR AXIOM ====================
 def _clean_allele(a):
-    if a is None:
-        return "0"
+    if a is None: return "0"
     a = str(a).strip()
     return "0" if a in ("", ".", "-", "NA", "nan", "None", "0", "00") else a
 
@@ -106,13 +105,11 @@ def _clean_allele(a):
 def sample_to_fid_iid(name, fid_parts=2):
     n = str(name).strip()
     for e in (".CEL", ".cel", ".TXT", ".txt", ".gz", ".GZ"):
-        if n.endswith(e):
-            n = n[:-len(e)]
+        if n.endswith(e): n = n[:-len(e)]
     n = (n.replace("(", "_").replace(")", "")
          .replace("[", "_").replace("]", "")
          .replace(" ", "_").replace("/", "_"))
-    while "__" in n:
-        n = n.replace("__", "_")
+    while "__" in n: n = n.replace("__", "_")
     n = n.strip("_")
     p = n.split("_")
     return ("_".join(p[:fid_parts]) if len(p) >= fid_parts else p[0]), n
@@ -120,21 +117,19 @@ def sample_to_fid_iid(name, fid_parts=2):
 
 def parse_axiom(raw, fn=""):
     if fn.endswith(".gz") or (len(raw) >= 2 and raw[:2] == b"\x1f\x8b"):
-        raw = gzip.decompress(raw)
+        try: raw = gzip.decompress(raw)
+        except Exception as e: raise ValueError(f".gz corrompu : {e}")
     text = raw.decode("utf-8", errors="replace")
     lines = [l.rstrip("\r\n") for l in text.splitlines() if l.strip()]
-    if not lines:
-        raise ValueError("Fichier vide.")
-    skip = 1 if (lines[0].startswith("#")
-                 or lines[0].startswith("Sample")
+    if not lines: raise ValueError("Fichier vide")
+    skip = 1 if (lines[0].startswith("#") or lines[0].startswith("Sample")
                  or "Sample ID" in lines[0][:50]) else 0
     samples, geno = [], []
     for line in lines[skip:]:
         p = line.split("\t")
         if len(p) < 2:
             p = line.split()
-            if len(p) < 2:
-                continue
+            if len(p) < 2: continue
         al = []
         for cell in [c.strip() for c in p[1:]]:
             t = cell.split()
@@ -153,14 +148,11 @@ def parse_axiom(raw, fn=""):
                 al.append(("0", "0"))
         samples.append(p[0].strip())
         geno.append(al)
-    if not samples:
-        raise ValueError("Aucun échantillon.")
+    if not samples: raise ValueError("Aucun échantillon")
     c = Counter([len(r) for r in geno]).most_common(1)[0][0]
     for i, r in enumerate(geno):
-        if len(r) > c:
-            geno[i] = r[:c]
-        elif len(r) < c:
-            geno[i] = r + [("0", "0")] * (c - len(r))
+        if len(r) > c: geno[i] = r[:c]
+        elif len(r) < c: geno[i] = r + [("0", "0")] * (c - len(r))
     return samples, geno, c
 
 
@@ -221,10 +213,8 @@ def render_axiom_page():
 
 # ==================== PARSERS ====================
 def _enc(b):
-    if len(b) >= 2 and b[:2] == b"\x1f\x8b":
-        return "gz"
-    if len(b) >= 2 and b[:2] == b"\x6c\x1b":
-        return "bin"
+    if len(b) >= 2 and b[:2] == b"\x1f\x8b": return "gz"
+    if len(b) >= 2 and b[:2] == b"\x6c\x1b": return "bin"
     return "txt"
 
 
@@ -232,25 +222,20 @@ def parse_map(b):
     if _enc(b) == "gz":
         text = gzip.decompress(b).decode("utf-8", errors="replace")
     elif _enc(b) == "bin":
-        raise ValueError("❌ .map binaire")
+        raise ValueError("❌ .map binaire PLINK")
     else:
         text = b.decode("utf-8", errors="replace")
     rows = []
     for line in text.splitlines():
         p = line.strip().split()
-        if len(p) < 4:
-            continue
-        try:
-            bp = int(float(p[3]))
-        except (ValueError, TypeError):
-            continue
-        try:
-            cm = float(p[2]) if p[2] not in ("0", ".", "NA") else 0.0
-        except ValueError:
-            cm = 0.0
-        rows.append({"CHR": str(p[0]), "SNP": str(p[1]), "CM": cm, "BP": bp})
-    if not rows:
-        raise ValueError("❌ .map vide")
+        if len(p) < 4: continue
+        try: bp = int(float(p[3]))
+        except (ValueError, TypeError): continue
+        try: cm = float(p[2]) if p[2] not in ("0", ".", "NA") else 0.0
+        except ValueError: cm = 0.0
+        rows.append({"CHR": str(p[0]), "SNP": str(p[1]),
+                     "CM": cm, "BP": bp})
+    if not rows: raise ValueError("❌ .map vide")
     return pd.DataFrame(rows)
 
 
@@ -258,51 +243,43 @@ def parse_ped(b, n_map):
     if _enc(b) == "gz":
         text = gzip.decompress(b).decode("utf-8", errors="replace")
     elif _enc(b) == "bin":
-        raise ValueError("❌ .ped binaire")
+        raise ValueError("❌ .ped binaire PLINK")
     else:
         text = b.decode("utf-8", errors="replace")
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not lines:
-        raise ValueError("❌ .ped vide")
+    if not lines: raise ValueError("❌ .ped vide")
     if len(lines) >= 2:
         n0, n1 = len(lines[0].split()), len(lines[1].split())
         if (n0 < 7 and n1 >= 7) or (n1 > 0 and n0 < n1 * 0.5):
             lines = lines[1:]
             st.info("ℹ️ Header PED ignoré")
     nc = len(lines[0].split())
-    if nc < 7:
-        raise ValueError(f"❌ {nc} colonnes PED")
+    if nc < 7: raise ValueError(f"❌ {nc} colonnes PED")
     n_ped = (nc - 6) // 2
     n = min(n_map, n_ped) if n_ped > 0 else n_map
     exp = 6 + 2 * n
     fids, iids, genos = [], [], []
     for line in lines:
         p = line.split()
-        if len(p) < exp:
-            continue
-        fids.append(p[0])
-        iids.append(p[1])
+        if len(p) < exp: continue
+        fids.append(p[0]); iids.append(p[1])
         genos.append(p[6:6 + 2 * n])
     ni = len(iids)
-    if ni == 0:
-        raise ValueError("❌ Aucun individu")
+    if ni == 0: raise ValueError("❌ Aucun individu")
     counts = [Counter() for _ in range(n)]
     for row in genos:
         for j in range(n):
             a1, a2 = row[2*j], row[2*j+1]
             if a1 != "0" and a2 != "0":
-                counts[j][a1] += 1
-                counts[j][a2] += 1
+                counts[j][a1] += 1; counts[j][a2] += 1
     minor = [min(c, key=c.get) if len(c) >= 2 else None for c in counts]
     gt = np.full((ni, n), np.nan, dtype=np.float32)
     for i, row in enumerate(genos):
         for j in range(n):
             m = minor[j]
-            if m is None:
-                continue
+            if m is None: continue
             a1, a2 = row[2*j], row[2*j+1]
-            if a1 == "0" or a2 == "0":
-                continue
+            if a1 == "0" or a2 == "0": continue
             gt[i, j] = (a1 == m) + (a2 == m)
     return gt, pd.DataFrame({"FID": fids, "IID": iids})
 
@@ -314,52 +291,40 @@ def parse_vcf(b):
         text = b.decode("utf-8", errors="replace")
     samples, rows = [], []
     for line in text.splitlines():
-        if not line or line.startswith("##"):
-            continue
+        if not line or line.startswith("##"): continue
         if line.startswith("#CHROM"):
-            samples = line.split("\t")[9:]
-            continue
-        if line.startswith("#"):
-            continue
+            samples = line.split("\t")[9:]; continue
+        if line.startswith("#"): continue
         p = line.split("\t")
-        if len(p) < 10 or "," in p[4]:
-            continue
-        try:
-            pos = int(p[1])
-        except ValueError:
-            continue
+        if len(p) < 10 or "," in p[4]: continue
+        try: pos = int(p[1])
+        except ValueError: continue
         fmt = p[8].split(":")
-        if "GT" not in fmt:
-            continue
+        if "GT" not in fmt: continue
         gi = fmt.index("GT")
         gts = np.full(len(samples), np.nan, dtype=np.float32)
         for k, s in enumerate(p[9:]):
             f = s.split(":")
-            if gi >= len(f):
-                continue
-            g = f[gi]
-            sep = "|" if "|" in g else "/"
-            al = g.split(sep)
-            if any(a in (".", "") for a in al):
-                continue
-            try:
-                gts[k] = sum(int(a) for a in al)
-            except ValueError:
-                continue
-        rows.append({"CHR": str(p[0]), "SNP": str(p[2] or f"{p[0]}:{pos}"),
-                     "CM": 0.0, "BP": pos, "A1": p[3], "A2": p[4], "GT": gts})
-    if not rows:
-        raise ValueError("❌ Aucun variant")
+            if gi >= len(f): continue
+            g = f[gi]; sep_ = "|" if "|" in g else "/"
+            al = g.split(sep_)
+            if any(a in (".", "") for a in al): continue
+            try: gts[k] = sum(int(a) for a in al)
+            except ValueError: continue
+        rows.append({"CHR": str(p[0]),
+                     "SNP": str(p[2] or f"{p[0]}:{pos}"),
+                     "CM": 0.0, "BP": pos, "A1": p[3], "A2": p[4],
+                     "GT": gts})
+    if not rows: raise ValueError("❌ Aucun variant")
     gt = np.zeros((len(samples), len(rows)), dtype=np.float32)
-    for j, r in enumerate(rows):
-        gt[:, j] = r["GT"]
+    for j, r in enumerate(rows): gt[:, j] = r["GT"]
     for j in range(len(rows)):
-        col = gt[:, j]
-        v = col[~np.isnan(col)]
+        col = gt[:, j]; v = col[~np.isnan(col)]
         if len(v) and v.mean() / 2.0 > 0.5:
             gt[:, j] = np.where(np.isnan(col), np.nan, 2.0 - col)
     snp_df = pd.DataFrame({
-        "CHR": [r["CHR"] for r in rows], "SNP": [r["SNP"] for r in rows],
+        "CHR": [r["CHR"] for r in rows],
+        "SNP": [r["SNP"] for r in rows],
         "CM": 0.0, "BP": [r["BP"] for r in rows],
         "A1": [r["A1"] for r in rows], "A2": [r["A2"] for r in rows]})
     return gt, pd.DataFrame({"FID": samples, "IID": samples}), snp_df
@@ -367,15 +332,12 @@ def parse_vcf(b):
 
 def demo_data(ni=150, ns=800, np_=4, seed=42):
     rng = np.random.default_rng(seed)
-    pool = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
-            "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"]
-    pops = pool[:min(np_, len(pool))]
+    pops = RACE_POOL[:min(np_, len(RACE_POOL))]
     per, rem = ni // len(pops), ni % len(pops)
     cnt = [per + (1 if i < rem else 0) for i in range(len(pops))]
     p_anc = rng.beta(0.6, 0.6, ns)
     gt = np.zeros((sum(cnt), ns), dtype=np.float32)
-    rows = []
-    k = 0
+    rows = []; k = 0
     for pop, n_i in zip(pops, cnt):
         pk = np.clip(p_anc + rng.normal(0, 0.15, ns), 0.02, 0.98)
         for i in range(n_i):
@@ -386,7 +348,8 @@ def demo_data(ni=150, ns=800, np_=4, seed=42):
             k += 1
     gt[rng.random(gt.shape) < 0.02] = np.nan
     chrs = rng.choice(AUTOSOMES, ns, p=_auto_weights())
-    bps = np.array([rng.integers(1, ARS_LEN[c]) for c in chrs], dtype=np.int64)
+    bps = np.array([rng.integers(1, ARS_LEN[c]) for c in chrs],
+                   dtype=np.int64)
     snp_df = pd.DataFrame({"CHR": chrs,
                            "SNP": [f"rs{i:07d}" for i in range(ns)],
                            "CM": 0.0, "BP": bps})
@@ -394,7 +357,7 @@ def demo_data(ni=150, ns=800, np_=4, seed=42):
     snp_df = (snp_df.sort_values(["_k", "BP"])
               .drop(columns="_k").reset_index(drop=True))
     return gt, pd.DataFrame(rows), snp_df
- # ==================== QC ====================
+  # ==================== QC ====================
 def miss_ind(g): return np.isnan(g).mean(axis=1)
 def miss_snp(g): return np.isnan(g).mean(axis=0)
 def af(g): return np.nanmean(g, axis=0) / 2.0
@@ -433,15 +396,22 @@ def hwe_pv(g):
     n1 = ((g == 1) & ~nm).sum(0)
     n2 = ((g == 2) & ~nm).sum(0)
     nv = n0 + n1 + n2
-    for j in range(m):
-        if nv[j] < 5: continue
-        pv[j] = _hwe_exact(int(n1[j]), int(n0[j]), int(n2[j]))
+    if m <= HWE_EXACT_MAX:
+        for j in range(m):
+            if nv[j] < 5: continue
+            pv[j] = _hwe_exact(int(n1[j]), int(n0[j]), int(n2[j]))
+    else:
+        p = (n1 + 2*n2) / (2.0 * np.where(nv > 0, nv, np.nan))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            eh = 2*p*(1-p)*nv
+            v = (eh >= 5) & np.isfinite(eh)
+            chi2 = (np.abs(n1-eh) - 0.5)**2 / eh
+            pv[v] = 1 - stats.chi2.cdf(chi2[v], df=1)
     return pv
 
 
 def _align(g, i, s):
-    n = min(g.shape[0], len(i))
-    m = min(g.shape[1], len(s))
+    n = min(g.shape[0], len(i)); m = min(g.shape[1], len(s))
     return (g[:n, :m], i.iloc[:n].reset_index(drop=True),
             s.iloc[:m].reset_index(drop=True))
 
@@ -471,7 +441,6 @@ def qc_filters(g, i, s, p):
         g, s = g[:, k], s[k].reset_index(drop=True)
     tr["hwe"] = int(mb - g.shape[1])
     if g.shape[1] == 0: raise ValueError("Tout exclu HWE")
-    # gt_snp = AVANT retrait HET outliers (sélection)
     gt_snp, ind_snp, snp_snp = g.copy(), i.copy(), s.copy()
     h = het(g); keep = np.ones(len(h), dtype=bool)
     for fid in i["FID"].unique():
@@ -488,13 +457,13 @@ def qc_filters(g, i, s, p):
     return (g, i, s,
             {"n_ind_init": n0, "n_snp_init": m0,
              "n_ind_final": g.shape[0], "n_snp_final": g.shape[1],
-             "excluded_ind": n0 - g.shape[0], "excluded_snp": m0 - g.shape[1],
+             "excluded_ind": n0 - g.shape[0],
+             "excluded_snp": m0 - g.shape[1],
              "n_ind_snp": gt_snp.shape[0], "n_snp_snp": gt_snp.shape[1],
              "trace": tr},
             gt_snp, ind_snp, snp_snp)
 
 
-# ==================== AUTOSOMES + LD PRUNING ====================
 def filter_auto(g, s):
     cs = s["CHR"].astype(str).str.upper().str.replace("CHR", "")
     k = cs.isin([str(i) for i in range(1, 30)])
@@ -504,8 +473,7 @@ def filter_auto(g, s):
 @cached
 def ld_pruning(g, w=50, st=5, r2t=0.2):
     n = g.shape[1]
-    if n < 3:
-        return np.ones(n, dtype=bool)
+    if n < 3: return np.ones(n, dtype=bool)
     keep = np.ones(n, dtype=bool)
     X = impute(g); X = X - X.mean(0)
     i = 0
@@ -517,14 +485,14 @@ def ld_pruning(g, w=50, st=5, r2t=0.2):
                 a, b = X[:, i], X[:, j]
                 if a.std() > 1e-8 and b.std() > 1e-8:
                     r = np.corrcoef(a, b)[0, 1]
-                    if r * r > r2t:
-                        keep[j] = False
+                    if r * r > r2t: keep[j] = False
             we += 1
         i += st
     return keep
 
 
 # ==================== STRUCTURE ====================
+@cached
 def pca_calc(g, nc=10):
     X = impute(g); X = X - X.mean(0)
     nc = min(nc, X.shape[0] - 1, X.shape[1])
@@ -532,6 +500,7 @@ def pca_calc(g, nc=10):
     return p.transform(X), p.explained_variance_ratio_ * 100
 
 
+@cached
 def mds_calc(g, nc=5):
     X = impute(g); n = X.shape[0]
     D = np.zeros((n, n), dtype=np.float32)
@@ -541,6 +510,7 @@ def mds_calc(g, nc=5):
                       n_init=1, max_iter=300).fit_transform(D)
 
 
+@cached
 def king_matrix(g):
     n = g.shape[0]
     h = np.nansum(g == 1, axis=1).astype(float)
@@ -549,12 +519,11 @@ def king_matrix(g):
         for j in range(i + 1, n):
             bh = np.nansum((g[i] == 1) & (g[j] == 1))
             d = h[i] + h[j]
-            K[i, j] = K[j, i] = (d - 2 * bh) / d if d > 0 else 0
+            K[i, j] = K[j, i] = (d - 2*bh) / d if d > 0 else 0
     np.fill_diagonal(K, 0.5)
     return K
 
 
-# ==================== ADMIXTURE NMF ====================
 @cached
 def admix_nmf(g, K=3, seed=42, mi=500):
     X = np.clip(impute(g), 0, 2)
@@ -583,12 +552,11 @@ def admix_cv(g, Kr=(2, 6), n_rep=3, ho=0.05, seed=42):
     return res
 
 
-# ==================== LD DECAY, ROH, Ne ====================
+# ==================== LD DECAY / ROH / Ne ====================
 @cached
 def ld_decay(g, bp, mk=1000, ms=1500, seed=42):
     n = g.shape[1]
-    if n < 2:
-        return pd.DataFrame(columns=["dist_kb", "r2"])
+    if n < 2: return pd.DataFrame(columns=["dist_kb", "r2"])
     rng = np.random.default_rng(seed)
     idx = (np.sort(rng.choice(n, ms, replace=False))
            if n > ms else np.arange(n))
@@ -597,8 +565,7 @@ def ld_decay(g, bp, mk=1000, ms=1500, seed=42):
     X = gs - gs.mean(0)
     sd = gs.std(0); sd[sd < 1e-8] = np.nan
     X = X / sd
-    C = (X.T @ X) / X.shape[0]
-    R2 = C ** 2
+    C = (X.T @ X) / X.shape[0]; R2 = C ** 2
     iu, ju = np.triu_indices(len(idx), k=1)
     dkb = (bp_s[ju] - bp_s[iu]) / 1000
     m = (dkb > 0) & (dkb <= mk)
@@ -611,8 +578,7 @@ def detect_roh(g, snp_json, min_s=30, min_kb=500):
     s = pd.DataFrame(json.loads(snp_json))
     chr_a = s["CHR"].astype(str).values
     bp = s["BP"].astype(np.int64).values
-    n = g.shape[0]
-    rohs, fbp = [], np.zeros(n)
+    n = g.shape[0]; rohs, fbp = [], np.zeros(n)
     tot = 0.0
     for ch in pd.unique(chr_a):
         ix = np.where(chr_a == ch)[0]
@@ -646,12 +612,13 @@ def detect_roh(g, snp_json, min_s=30, min_kb=500):
                     rohs.append({"IID_idx": i, "CHR": str(ch),
                                  "start_bp": int(bp[ix[sk]]),
                                  "end_bp": int(bp[ix[-1]]),
-                                 "n_snp": int(nr), "length_kb": float(lkb)})
+                                 "n_snp": int(nr),
+                                 "length_kb": float(lkb)})
                     fbp[i] += bp[ix[-1]] - bp[ix[sk]]
     froh = fbp / tot if tot > 0 else fbp
-    roh = (pd.DataFrame(rohs) if rohs else
-           pd.DataFrame(columns=["IID_idx", "CHR", "start_bp", "end_bp",
-                                 "n_snp", "length_kb"]))
+    roh = (pd.DataFrame(rohs) if rohs
+           else pd.DataFrame(columns=["IID_idx", "CHR", "start_bp",
+                                       "end_bp", "n_snp", "length_kb"]))
     return roh, froh
 
 
@@ -683,7 +650,7 @@ def estimate_ne(g, s, ms=2000):
     m_ = np.isfinite(rb)
     if m_.sum() < 3: return pd.DataFrame({"GenAgo": [], "Ne": []})
     c = bc[m_] * 0.01; r = rb[m_]
-    ne = np.where(r > 1e-4, 1 / (4 * c * r), np.nan)
+    ne = np.where(r > 1e-4, 1 / (4*c*r), np.nan)
     df = pd.DataFrame({"GenAgo": bc[m_] * 100, "Ne": ne}).dropna()
     df = df[df["Ne"] > 0].sort_values("GenAgo")
     if len(df) > 3:
@@ -691,7 +658,8 @@ def estimate_ne(g, s, ms=2000):
     return df
 
 
-# ==================== FST & GROUPES ====================
+# ==================== FST ====================
+@cached
 def fst_per_snp(g, labels):
     labels = np.asarray(labels, dtype=object)
     pops = np.unique(labels)
@@ -703,66 +671,68 @@ def fst_per_snp(g, labels):
         for p in pops:
             v = g[mk[p], j]; v = v[~np.isnan(v)]
             if len(v) < 3: continue
-            ps.append(v.mean() / 2); ns.append(len(v))
+            ps.append(v.mean()/2); ns.append(len(v))
         if len(ps) < 2: continue
         pa, na = np.array(ps), np.array(ns)
         pb = np.average(pa, weights=na)
-        hs = np.average(2 * pa * (1 - pa), weights=na)
-        ht = 2 * pb * (1 - pb)
+        hs = np.average(2*pa*(1-pa), weights=na)
+        ht = 2*pb*(1-pb)
         if ht > 1e-9: out[j] = (ht - hs) / ht
     return out
 
 
+@cached
 def fst_pair(g, labels):
     labels = np.asarray(labels, dtype=object)
     pops = sorted(np.unique(labels))
-    K = len(pops)
-    M = np.full((K, K), np.nan); np.fill_diagonal(M, 0)
+    K = len(pops); M = np.full((K, K), np.nan); np.fill_diagonal(M, 0)
     mk = {p: labels == p for p in pops}
     for i in range(K):
         for j in range(i + 1, K):
             g1, g2 = g[mk[pops[i]]], g[mk[pops[j]]]
-            p1, p2 = np.nanmean(g1, 0) / 2, np.nanmean(g2, 0) / 2
+            p1, p2 = np.nanmean(g1, 0)/2, np.nanmean(g2, 0)/2
             n1, n2 = (~np.isnan(g1)).sum(0), (~np.isnan(g2)).sum(0)
-            dn = np.where(n1 + n2 > 0, n1 + n2, np.nan)
-            pb = (p1*n1 + p2*n2) / dn
-            hs = (2*p1*(1-p1)*n1 + 2*p2*(1-p2)*n2) / dn
-            ht = 2 * pb * (1 - pb)
+            dn = np.where(n1+n2 > 0, n1+n2, np.nan)
+            pb = (p1*n1 + p2*n2)/dn
+            hs = (2*p1*(1-p1)*n1 + 2*p2*(1-p2)*n2)/dn
+            ht = 2*pb*(1-pb)
             with np.errstate(divide="ignore", invalid="ignore"):
-                f = (ht - hs) / ht
+                f = (ht-hs)/ht
             M[i, j] = M[j, i] = float(np.nanmean(f))
     return M, pops
 
 
+@cached
 def fst_grp_vs_rest(g, labels, gp):
     labels = np.asarray(labels, dtype=object)
     mg = np.isin(labels, list(gp)); mr = ~mg
     if mg.sum() < 5 or mr.sum() < 5: return pd.DataFrame()
-    p_g, p_r = np.nanmean(g[mg], 0) / 2, np.nanmean(g[mr], 0) / 2
+    p_g, p_r = np.nanmean(g[mg], 0)/2, np.nanmean(g[mr], 0)/2
     n_g, n_r = (~np.isnan(g[mg])).sum(0), (~np.isnan(g[mr])).sum(0)
-    dn = np.where(n_g + n_r > 0, n_g + n_r, np.nan)
-    pb = (p_g*n_g + p_r*n_r) / dn
-    hs = (2*p_g*(1-p_g)*n_g + 2*p_r*(1-p_r)*n_r) / dn
-    ht = 2 * pb * (1 - pb)
+    dn = np.where(n_g+n_r > 0, n_g+n_r, np.nan)
+    pb = (p_g*n_g + p_r*n_r)/dn
+    hs = (2*p_g*(1-p_g)*n_g + 2*p_r*(1-p_r)*n_r)/dn
+    ht = 2*pb*(1-pb)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f = (ht - hs) / ht
+        f = (ht-hs)/ht
     f = np.clip(np.where(np.isfinite(f), f, np.nan), 0, 1)
     return pd.DataFrame({"FST": f, "P_group": p_g, "P_rest": p_r,
                          "n_group": n_g, "n_rest": n_r})
 
 
-def fst_grp_vs_grp(g, labels, pa, pb):
+@cached
+def fst_grp_vs_grp(g, labels, pa, pb_):
     labels = np.asarray(labels, dtype=object)
-    ma = np.isin(labels, list(pa)); mb = np.isin(labels, list(pb))
+    ma, mb = np.isin(labels, list(pa)), np.isin(labels, list(pb_))
     if ma.sum() < 5 or mb.sum() < 5: return pd.DataFrame()
-    p_A, p_B = np.nanmean(g[ma], 0) / 2, np.nanmean(g[mb], 0) / 2
+    p_A, p_B = np.nanmean(g[ma], 0)/2, np.nanmean(g[mb], 0)/2
     n_A, n_B = (~np.isnan(g[ma])).sum(0), (~np.isnan(g[mb])).sum(0)
-    dn = np.where(n_A + n_B > 0, n_A + n_B, np.nan)
-    p_bar = (p_A*n_A + p_B*n_B) / dn
-    hs = (2*p_A*(1-p_A)*n_A + 2*p_B*(1-p_B)*n_B) / dn
-    ht = 2 * p_bar * (1 - p_bar)
+    dn = np.where(n_A+n_B > 0, n_A+n_B, np.nan)
+    p_bar = (p_A*n_A + p_B*n_B)/dn
+    hs = (2*p_A*(1-p_A)*n_A + 2*p_B*(1-p_B)*n_B)/dn
+    ht = 2*p_bar*(1-p_bar)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f = (ht - hs) / ht
+        f = (ht-hs)/ht
     f = np.clip(np.where(np.isfinite(f), f, np.nan), 0, 1)
     return pd.DataFrame({"FST": f, "P_A": p_A, "P_B": p_B,
                          "n_A": n_A, "n_B": n_B})
@@ -775,7 +745,8 @@ def _extract_out(fst_df, snp_df, q, mf):
                    ).dropna(subset=["FST"])
     if df.empty: return pd.DataFrame(), {}
     thr = max(float(np.nanquantile(df["FST"], q)), mf)
-    out = (df[df["FST"] >= thr].sort_values("FST", ascending=False)
+    out = (df[df["FST"] >= thr]
+           .sort_values("FST", ascending=False)
            .reset_index(drop=True))
     return out, {"n_snp_analyzed": len(df), "n_snp_outliers": len(out),
                  "fst_mean": float(df["FST"].mean()),
@@ -784,18 +755,18 @@ def _extract_out(fst_df, snp_df, q, mf):
                  "threshold": float(thr)}
 
 
-def analyze_pop_vs_rest(g, s, labels, pops, q=0.99, mf=0.15):
+def analyze_pop_vs_rest(g, s, labels, q=0.99, mf=0.15):
     res = {}
     for pop in sorted(np.unique(labels)):
         if (labels == pop).sum() < 3: continue
         f = fst_grp_vs_rest(g, labels, [pop])
         if f.empty: continue
         out, st_ = _extract_out(f, s, q, mf)
-        res[pop] = {"pop": pop, "status": "success",
+        res[pop] = {"pop": pop, "status": "success", "pops": [pop],
                     "all_fst_df": pd.concat(
                         [s.reset_index(drop=True),
                          f.reset_index(drop=True)], axis=1),
-                    "outliers_df": out, "pops": [pop], **st_}
+                    "outliers_df": out, **st_}
     return res
 
 
@@ -823,23 +794,13 @@ def analyze_grp_pair(g, s, labels, groups, gA, gB, q=0.99, mf=0.15):
     if f.empty: return {"status": "insufficient"}
     out, st_ = _extract_out(f, s, q, mf)
     return {"status": "success", "group_A": gA, "group_B": gB,
-            "pops_A": groups.get(gA, []),
-            "pops_B": groups.get(gB, []),
+            "pops_A": groups.get(gA, []), "pops_B": groups.get(gB, []),
             "all_fst_df": pd.concat(
                 [s.reset_index(drop=True),
                  f.reset_index(drop=True)], axis=1),
             "outliers_df": out, **st_}
 
 
-def grp_phenotype(ind_df, groups, gname):
-    df = ind_df.copy()
-    df["pheno"] = 0.0
-    df.loc[df["FID"].astype(str).isin(groups.get(gname, [])),
-           "pheno"] = 1.0
-    return df
-
-
-# ==================== BINÔMES (paire de races) ====================
 @cached
 def analyze_pair(g, s, labels, a, b, q=0.99, mf=0.15):
     labels = np.asarray(labels, dtype=object)
@@ -847,14 +808,14 @@ def analyze_pair(g, s, labels, a, b, q=0.99, mf=0.15):
     if mA.sum() < 3 or mB.sum() < 3:
         return {"status": "insufficient", "pop_A": a, "pop_B": b}
     gA, gB = g[mA], g[mB]
-    pA = np.nanmean(gA, 0) / 2; pB = np.nanmean(gB, 0) / 2
+    pA = np.nanmean(gA, 0)/2; pB = np.nanmean(gB, 0)/2
     nA = (~np.isnan(gA)).sum(0); nB = (~np.isnan(gB)).sum(0)
-    dn = np.where(nA + nB > 0, nA + nB, np.nan)
-    pb = (pA*nA + pB*nB) / dn
-    hs = (2*pA*(1-pA) + 2*pB*(1-pB)) / 2
-    ht = 2 * pb * (1 - pb)
+    dn = np.where(nA+nB > 0, nA+nB, np.nan)
+    pb = (pA*nA + pB*nB)/dn
+    hs = (2*pA*(1-pA) + 2*pB*(1-pB))/2
+    ht = 2*pb*(1-pb)
     with np.errstate(divide="ignore", invalid="ignore"):
-        f = (ht - hs) / ht
+        f = (ht-hs)/ht
     f = np.clip(np.where(np.isfinite(f), f, np.nan), 0, 1)
     fst_df = pd.DataFrame({"FST": f, "P_A": pA, "P_B": pB,
                            "P_bar": pb, "n_A": nA, "n_B": nB})
@@ -865,6 +826,14 @@ def analyze_pair(g, s, labels, a, b, q=0.99, mf=0.15):
             "all_fst_df": pd.concat(
                 [s.reset_index(drop=True),
                  fst_df.reset_index(drop=True)], axis=1), **st_}
+
+
+def grp_phenotype(ind_df, groups, gname):
+    df = ind_df.copy()
+    df["pheno"] = 0.0
+    df.loc[df["FID"].astype(str).isin(groups.get(gname, [])),
+           "pheno"] = 1.0
+    return df
 
 
 def auto_pairs_mds(mds, labels, qlo=0.15, qhi=0.85):
@@ -878,7 +847,7 @@ def auto_pairs_mds(mds, labels, qlo=0.15, qhi=0.85):
         cents[p] = mds[m, :2].mean(0); cnts[p] = int(m.sum())
     if len(cents) < 2: return pd.DataFrame()
     pairs = [{"pop_A": a, "pop_B": b,
-              "distance_MDS": float(np.linalg.norm(cents[a] - cents[b])),
+              "distance_MDS": float(np.linalg.norm(cents[a]-cents[b])),
               "n_ind_A": cnts[a], "n_ind_B": cnts[b]}
              for a, b in itertools.combinations(cents.keys(), 2)]
     df = pd.DataFrame(pairs).sort_values("distance_MDS").reset_index(drop=True)
@@ -920,14 +889,13 @@ def annotate_snps(out, gdf, fl=500):
         gc = gdf[gdf["CHR"] == ch]
         if gc.empty:
             rows.append({**snp.to_dict(), "gene_name": None,
-                         "distance": None, "region": None})
-            continue
+                         "distance": None, "region": None}); continue
         cd = []
         for _, gn in gc.iterrows():
             if gn["start"] <= bp <= gn["end"]:
                 cd.append((gn["gene_name"], 0, "intragenic"))
             else:
-                d = min(abs(bp - gn["start"]), abs(bp - gn["end"]))
+                d = min(abs(bp-gn["start"]), abs(bp-gn["end"]))
                 if d <= flb:
                     r = "upstream" if bp < gn["start"] else "downstream"
                     cd.append((gn["gene_name"], d, r))
@@ -945,7 +913,7 @@ def annotate_snps(out, gdf, fl=500):
 def gwas_local(g, s, i, ph, ch, bp_, pn, wc=10):
     wbp = wc * 1e6
     mask = ((s["CHR"].astype(str) == str(ch))
-            & (s["BP"] >= bp_ - wbp) & (s["BP"] <= bp_ + wbp))
+            & (s["BP"] >= bp_-wbp) & (s["BP"] <= bp_+wbp))
     idx = np.where(mask)[0]
     if len(idx) == 0: return pd.DataFrame()
     i = i.copy(); i["IID"] = i["IID"].astype(str)
@@ -961,12 +929,11 @@ def gwas_local(g, s, i, ph, ch, bp_, pn, wc=10):
             v = ph.loc[iid, pn]
             if isinstance(v, pd.Series): v = v.iloc[0]
             pv.append(float(v))
-        except Exception:
-            pv.append(np.nan)
+        except Exception: pv.append(np.nan)
     pv = np.array(pv)
     pops = ins["FID"].astype(str).values
     up = sorted(set(pops))
-    dm = np.zeros((len(pops), max(0, len(up) - 1)))
+    dm = np.zeros((len(pops), max(0, len(up)-1)))
     for k, p in enumerate(pops):
         for j, u in enumerate(up[1:]):
             if p == u: dm[k, j] = 1
@@ -977,36 +944,36 @@ def gwas_local(g, s, i, ph, ch, bp_, pn, wc=10):
         v = ~np.isnan(gg) & ~np.isnan(pv)
         if v.sum() < 10: continue
         gv, pvv = gg[v], pv[v]
-        X = np.column_stack([np.ones(v.sum()), gv, dm[v]]) if dm.shape[1] > 0 \
-            else np.column_stack([np.ones(v.sum()), gv])
+        X = (np.column_stack([np.ones(v.sum()), gv, dm[v]])
+             if dm.shape[1] > 0
+             else np.column_stack([np.ones(v.sum()), gv]))
         try:
             beta, _, _, _ = np.linalg.lstsq(X, pvv, rcond=None)
             r = pvv - X @ beta
-            ssr = np.sum(r ** 2); sst = np.sum((pvv - pvv.mean()) ** 2)
-            r2 = 1 - ssr / sst if sst > 0 else 0
+            ssr = np.sum(r**2); sst = np.sum((pvv-pvv.mean())**2)
+            r2 = 1 - ssr/sst if sst > 0 else 0
             dr = v.sum() - X.shape[1]
             if dr > 0:
-                mse = ssr / dr
+                mse = ssr/dr
                 try:
                     cv = np.linalg.inv(X.T @ X)
-                    se = np.sqrt(mse * cv[1, 1])
-                    tv = beta[1] / se
-                    pval = 2 * (1 - stats.t.cdf(abs(tv), dr))
+                    se = np.sqrt(mse*cv[1, 1])
+                    tv = beta[1]/se
+                    pval = 2*(1-stats.t.cdf(abs(tv), dr))
                 except np.linalg.LinAlgError:
                     pval, tv = np.nan, np.nan
-            else:
-                pval, tv = np.nan, np.nan
-            res.append({"SNP": sw.iloc[j]["SNP"], "CHR": sw.iloc[j]["CHR"],
+            else: pval, tv = np.nan, np.nan
+            res.append({"SNP": sw.iloc[j]["SNP"],
+                        "CHR": sw.iloc[j]["CHR"],
                         "BP": int(sw.iloc[j]["BP"]),
                         "beta": float(beta[1]),
                         "t_stat": float(tv) if np.isfinite(tv) else np.nan,
                         "p_value": float(pval) if np.isfinite(pval) else np.nan,
                         "r2": float(r2), "n_obs": int(v.sum())})
-        except Exception:
-            continue
+        except Exception: continue
     df = pd.DataFrame(res)
     if not df.empty:
-        df["p_bonf"] = np.minimum(1, df["p_value"] * len(df))
+        df["p_bonf"] = np.minimum(1, df["p_value"]*len(df))
         df["neg_log10_p"] = -np.log10(df["p_value"].clip(lower=1e-300))
         df = df.sort_values("p_value")
     return df
@@ -1021,14 +988,13 @@ def _dos_bits(c):
 
 
 def build_bed(g):
-    n, m = g.shape
-    nb = (n + 3) // 4
+    n, m = g.shape; nb = (n+3)//4
     buf = bytearray([0x6C, 0x1B, 0x01])
     for j in range(m):
         bits = _dos_bits(g[:, j])
         p = np.zeros(nb, dtype=np.uint8)
         for k in range(n):
-            p[k // 4] |= (bits[k] & 3) << (2 * (k % 4))
+            p[k//4] |= (bits[k] & 3) << (2*(k % 4))
         buf.extend(p.tobytes())
     return bytes(buf)
 
@@ -1118,7 +1084,7 @@ def plt_gwas(df, ch, bp):
                       "<extra></extra>", text=df["SNP"]))
     fig.add_hline(y=-np.log10(0.05), line_dash="dash", line_color="orange",
                   annotation_text="p=0.05")
-    fig.add_hline(y=-np.log10(0.05 / max(len(df), 1)), line_dash="dash",
+    fig.add_hline(y=-np.log10(0.05/max(len(df), 1)), line_dash="dash",
                   line_color="red", annotation_text="Bonferroni")
     fig.add_vline(x=bp, line_dash="dot", line_color="blue",
                   annotation_text="SNP cible")
@@ -1126,17 +1092,16 @@ def plt_gwas(df, ch, bp):
                       xaxis_title="Position (bp)", yaxis_title="-log10(p)",
                       height=450)
     return fig
-# ==================== ÉTAT ====================
+  # ==================== ÉTAT ====================
 STATE_KEYS = ["gt", "ind_df", "snp_df", "gt_filt", "ind_filt", "snp_filt",
               "qc_stats", "gt_snp", "ind_snp", "snp_snp",
               "gt_pruned", "snp_pruned", "pca_scores", "pca_var",
               "mds_coords", "king_matrix", "ld_df", "roh_df", "froh",
               "admixture_Q", "admixture_K", "cv_results",
-              "ne_dict", "reynolds_D", "reynolds_pops",
-              "fst_global", "fst_pops", "fst_pair_matrix",
-              "binome_result", "all_binomes", "custom_pairs",
-              "group_results", "group_pair", "gwas_results",
-              "genes_df", "_ax_ped", "_ax_map", "_ax_n", "_ax_samples"]
+              "reynolds_D", "reynolds_pops", "fst_global",
+              "binome_result", "all_binomes", "group_results",
+              "group_pair", "gwas_results", "genes_df",
+              "_ax_ped", "_ax_map", "_ax_n", "_ax_samples"]
 
 
 def init_state():
@@ -1152,9 +1117,8 @@ def reset_derived():
               "gt_snp", "ind_snp", "snp_snp", "gt_pruned", "snp_pruned",
               "pca_scores", "pca_var", "mds_coords", "king_matrix",
               "ld_df", "roh_df", "froh", "admixture_Q", "admixture_K",
-              "cv_results", "ne_dict", "reynolds_D", "reynolds_pops",
-              "fst_global", "fst_pops", "fst_pair_matrix",
-              "binome_result", "all_binomes",
+              "cv_results", "reynolds_D", "reynolds_pops",
+              "fst_global", "binome_result", "all_binomes",
               "group_results", "group_pair", "gwas_results"]:
         st.session_state[k] = None
 
@@ -1172,9 +1136,9 @@ def has_pruned():
 # ==================== MAIN ====================
 def main():
     init_state()
-    st.title("🐄 Bovine SNP Platform v6.3")
-    st.caption("Binômes + Signatures par population + Groupes + "
-               "Annotation GTF + GWAS 10 cM")
+    st.title("🐄 Bovine SNP Platform v6.2")
+    st.caption("Pipeline complet · Binômes · Signatures population · "
+               "Groupes de races · Annotation GTF · GWAS 10 cM")
 
     # ----- SIDEBAR -----
     with st.sidebar:
@@ -1269,8 +1233,7 @@ def main():
         if st.button("🚀 Pipeline complet", type="primary",
                      use_container_width=True, key="sb_pipe"):
             st.session_state["_run_pipe"] = True
-
-        st.caption("v6.3")
+        st.caption("v6.2 — Complete")
 
     # ----- CONVERTISSEUR AXIOM -----
     if mode == "Convertisseur Axiom":
@@ -1282,7 +1245,7 @@ def main():
         st.info("👉 Générez un jeu de démo, importez PED/MAP/VCF, "
                 "ou utilisez le Convertisseur Axiom.")
         st.markdown("""
-        ### 🧬 v6.3 — 12 onglets
+        ### 🧬 v6.2 — 12 onglets
 
         | Onglet | Contenu |
         |---|---|
@@ -1294,12 +1257,12 @@ def main():
         | 📈 Démographie | LD decay + ROH + Ne |
         | 🔍 Sélection | FST Manhattan |
         | 🌳 Phylogénie | Reynolds + NJ |
-        | 📤 Export | PLINK + VCF |
+        | 📤 Export | PLINK |
         | 🧬 **Binômes** | 5 modes + **signature/pop** + **groupes** |
-        | 🧪 **SNP & Gènes** | **GWAS 10 cM + annotation GTF** |
+        | 🧪 **SNP & Gènes** | **GWAS 10 cM + GTF** |
         | 📄 Rapport | HTML |
 
-        ### 🆕 v6.3
+        ### 🆕 v6.2
         - ✅ Fix `detect_roh`
         - ✅ Convertisseur Axiom
         - ✅ Signatures par **population** (vs reste)
@@ -1318,7 +1281,7 @@ def main():
                     "🌳 Phylogénie", "📤 Export", "🧬 Binômes",
                     "🧪 SNP & Gènes", "📄 Rapport"])
 
-    # ----- TAB 0 : Aperçu -----
+    # ----- TAB 0 -----
     with tabs[0]:
         c1, c2, c3 = st.columns(3)
         c1.metric("Individus", gt.shape[0])
@@ -1381,8 +1344,8 @@ def main():
                 with st.spinner("Pruning..."):
                     k = ld_pruning(st.session_state.gt_filt, 50, 5, ld_r2)
                     st.session_state.gt_pruned = st.session_state.gt_filt[:, k]
-                    st.session_state.snp_pruned = (st.session_state.snp_filt[k]
-                                                    .reset_index(drop=True))
+                    st.session_state.snp_pruned = (
+                        st.session_state.snp_filt[k].reset_index(drop=True))
                 st.success(f"✅ {st.session_state.gt_pruned.shape[1]} SNPs")
 
     # ----- TAB 3 : Structure -----
@@ -1427,12 +1390,13 @@ def main():
             if st.button("▶ CV", use_container_width=True, key="ad_cv"):
                 with st.spinner("CV..."):
                     st.session_state.cv_results = admix_cv(
-                        gu, (2, Km + 1), int(nr))
+                        gu, (2, Km+1), int(nr))
                 st.success("✅")
             if st.session_state.cv_results is not None:
                 ks = sorted(st.session_state.cv_results.keys())
                 means = [st.session_state.cv_results[k]["mean"] for k in ks]
-                fig = go.Figure(go.Scatter(x=ks, y=means, mode="lines+markers",
+                fig = go.Figure(go.Scatter(x=ks, y=means,
+                                            mode="lines+markers",
                                             line=dict(color="crimson",
                                                       width=3),
                                             marker=dict(size=12)))
@@ -1442,7 +1406,8 @@ def main():
                 fig.update_layout(title="CV Error", height=400)
                 st.plotly_chart(fig, use_container_width=True)
             K = st.slider("K", 2, 10, 4, key="ad_K")
-            if st.button("▶ Admixture", use_container_width=True, key="ad_r"):
+            if st.button("▶ Admixture", use_container_width=True,
+                         key="ad_r"):
                 with st.spinner("NMF..."):
                     Q, _ = admix_nmf(gu, int(K))
                     st.session_state.admixture_Q = Q
@@ -1500,8 +1465,8 @@ def main():
                 if st.session_state.froh is not None:
                     df = pd.DataFrame({"FROH": st.session_state.froh,
                                        "Pop": st.session_state.ind_filt["FID"].values})
-                    st.plotly_chart(px.histogram(df, x="FROH", color="Pop",
-                                                  nbins=50),
+                    st.plotly_chart(px.histogram(df, x="FROH",
+                                                  color="Pop", nbins=50),
                                     use_container_width=True)
 
     # ----- TAB 6 : Sélection globale -----
@@ -1522,7 +1487,8 @@ def main():
                         gu, iu["FID"].values)
                 st.success("✅")
             if st.session_state.fst_global is not None:
-                fig = plt_man(st.session_state.fst_global, su["CHR"].values)
+                fig = plt_man(st.session_state.fst_global,
+                              su["CHR"].values)
                 if fig: st.plotly_chart(fig, use_container_width=True)
 
     # ----- TAB 7 : Phylogénie -----
@@ -1534,7 +1500,8 @@ def main():
             gu = (st.session_state.gt_pruned if has_pruned()
                   else st.session_state.gt_filt)
             iu = st.session_state.ind_filt
-            if st.button("▶ Reynolds", use_container_width=True, key="rey"):
+            if st.button("▶ Reynolds", use_container_width=True,
+                         key="rey"):
                 with st.spinner("..."):
                     lb = iu["FID"].astype(str).values
                     pops = sorted(np.unique(lb))
@@ -1542,11 +1509,11 @@ def main():
                     K = len(pops)
                     D = np.zeros((K, K))
                     for i in range(K):
-                        for j in range(i + 1, K):
+                        for j in range(i+1, K):
                             pi, pj = ph[pops[i]], ph[pops[j]]
-                            num = np.nansum((pi - pj) ** 2)
-                            den = np.nansum(pi * (1 - pj) + pj * (1 - pi))
-                            if den > 0: D[i, j] = D[j, i] = num / den
+                            num = np.nansum((pi-pj)**2)
+                            den = np.nansum(pi*(1-pj) + pj*(1-pi))
+                            if den > 0: D[i, j] = D[j, i] = num/den
                     st.session_state.reynolds_D = D
                     st.session_state.reynolds_pops = pops
                 st.success("✅")
@@ -1561,13 +1528,15 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
                 try:
                     from scipy.cluster.hierarchy import linkage, to_tree
-                    Z = linkage(squareform(D, checks=False), method="average")
+                    Z = linkage(squareform(D, checks=False),
+                                method="average")
                     tree = to_tree(Z)
                     def rec(n):
-                        if n.is_leaf(): return f"{pops[n.id]}:{n.dist:.4f}"
-                        return f"({rec(n.get_left())},{rec(n.get_right())}):{n.dist:.4f}"
-                    newick = rec(tree)
-                    st.code(newick, language="text")
+                        if n.is_leaf():
+                            return f"{pops[n.id]}:{n.dist:.4f}"
+                        return (f"({rec(n.get_left())},"
+                                f"{rec(n.get_right())}):{n.dist:.4f}")
+                    st.code(rec(tree), language="text")
                 except Exception as e:
                     st.warning(f"NJ : {e}")
 
@@ -1583,7 +1552,8 @@ def main():
             se = (st.session_state.snp_pruned if has_pruned()
                   else st.session_state.snp_filt)
             pre = st.text_input("Préfixe", "bovine_qc", key="ex_p")
-            if st.button("📦 Générer", use_container_width=True, key="ex_g"):
+            if st.button("📦 Générer", use_container_width=True,
+                         key="ex_g"):
                 try:
                     with st.spinner("..."):
                         data = build_zip(ge, ie, se, pre)
@@ -1592,7 +1562,7 @@ def main():
                 except Exception as e:
                     st.error(f"❌ {e}")
 
-    # ----- TAB 9 : Binômes -----
+    # ----- TAB 9 : BINÔMES + GROUPES -----
     with tabs[9]:
         st.subheader("🧬 Binômes & Signatures")
         if not has_qc():
@@ -1620,16 +1590,18 @@ def main():
             c1, c2 = st.columns(2)
             q_b = c1.slider("Quantile", 0.90, 0.9999, 0.99, 0.001,
                              format="%.4f", key="bin_q")
-            fst_b = c2.slider("FST min", 0.0, 0.5, 0.15, 0.01, key="bin_mf")
+            fst_b = c2.slider("FST min", 0.0, 0.5, 0.15, 0.01,
+                               key="bin_mf")
 
-            # Auto-MDS
+            # --- Auto-MDS ---
             if mode_b == "🧠 Auto-MDS":
                 if st.session_state.mds_coords is None:
                     st.warning("⚠️ Lancez Structure d'abord.")
                 else:
                     pairs = auto_pairs_mds(st.session_state.mds_coords, lb)
                     if not pairs.empty:
-                        st.dataframe(pairs.head(20), use_container_width=True)
+                        st.dataframe(pairs.head(20),
+                                      use_container_width=True)
                         opts = [f"{r['pop_A']} ↔ {r['pop_B']} "
                                 f"[{r['catégorie']}]"
                                 for _, r in pairs.iterrows()]
@@ -1639,19 +1611,20 @@ def main():
                         if st.button(f"▶ {a} vs {b}", type="primary",
                                      key="auto_run"):
                             with st.spinner("..."):
-                                r = analyze_pair(gu, su, lb, a, b, q_b, fst_b)
-                                st.session_state.binome_result = r
+                                st.session_state.binome_result = analyze_pair(
+                                    gu, su, lb, a, b, q_b, fst_b)
                         r = st.session_state.binome_result
                         if r and r.get("status") == "success":
                             st.metric("SNP outliers", r["n_snp_outliers"])
                             fig = plt_man(r["all_fst_df"]["FST"].values,
                                           r["all_fst_df"]["CHR"].values,
                                           title=f"{a} vs {b}")
-                            if fig: st.plotly_chart(fig, use_container_width=True)
+                            if fig: st.plotly_chart(fig,
+                                                     use_container_width=True)
                             st.dataframe(r["outliers_df"].head(100),
                                           use_container_width=True)
 
-            # Manuelle
+            # --- Manuelle ---
             elif mode_b == "🖱️ Manuelle":
                 c1, c2 = st.columns(2)
                 a = c1.selectbox("Pop A", avail, key="man_a")
@@ -1675,20 +1648,20 @@ def main():
                                         f"outliers_{a}_{b}.csv", "text/csv",
                                         key="man_dl")
 
-            # Toutes paires
+            # --- Toutes paires ---
             elif mode_b == "🌐 Toutes paires":
                 import itertools
                 pairs = list(itertools.combinations(avail, 2))
                 st.info(f"{len(pairs)} paires")
-                if st.button(f"▶ Analyser {len(pairs)} paires",
-                             type="primary", use_container_width=True,
-                             key="all_run"):
+                if st.button(f"▶ Analyser {len(pairs)}",
+                             type="primary",
+                             use_container_width=True, key="all_run"):
                     res = {}
                     prog = st.progress(0)
                     for i, (a, b) in enumerate(pairs):
                         res[f"{a}_vs_{b}"] = analyze_pair(
                             gu, su, lb, a, b, q_b, fst_b)
-                        prog.progress((i + 1) / len(pairs))
+                        prog.progress((i+1)/len(pairs))
                     st.session_state.all_binomes = res
                     st.success(f"✅ {len(res)}")
                 if st.session_state.all_binomes:
@@ -1698,16 +1671,17 @@ def main():
                             for k, v in st.session_state.all_binomes.items()
                             if v.get("status") == "success"]
                     if summ:
-                        df_s = pd.DataFrame(summ).sort_values(
-                            "FST moyen", ascending=False)
+                        df_s = (pd.DataFrame(summ)
+                                .sort_values("FST moyen", ascending=False))
                         st.dataframe(df_s, use_container_width=True)
 
-            # Signature par population
+            # --- Signature par population ---
             elif mode_b == "🎯 Signature par population":
-                st.info("FST de chaque race vs toutes les autres regroupées.")
+                st.info("FST de chaque race vs toutes les autres "
+                        "regroupées.")
                 if st.button("▶ Toutes les populations", type="primary",
                              use_container_width=True, key="pop_rest"):
-                    res = analyze_pop_vs_rest(gu, su, lb, avail, q_b, fst_b)
+                    res = analyze_pop_vs_rest(gu, su, lb, q_b, fst_b)
                     st.session_state.group_results = res
                     st.success(f"✅ {len(res)} populations")
                 if st.session_state.group_results:
@@ -1729,16 +1703,17 @@ def main():
                             fig = plt_man(v["all_fst_df"]["FST"].values,
                                           v["all_fst_df"]["CHR"].values,
                                           title=f"{sel} vs reste")
-                            if fig: st.plotly_chart(fig, use_container_width=True)
+                            if fig: st.plotly_chart(fig,
+                                                     use_container_width=True)
                             st.dataframe(v["outliers_df"].head(100),
                                           use_container_width=True)
                             csv = v["outliers_df"].to_csv(
                                 index=False).encode("utf-8")
                             st.download_button(f"⬇ {sel}", csv,
-                                                f"sig_{sel}.csv", "text/csv",
-                                                key="pop_dl")
+                                                f"sig_{sel}.csv",
+                                                "text/csv", key="pop_dl")
 
-            # Signature par groupe
+            # --- Signature par groupe ---
             elif mode_b == "🐄 Signature par groupe":
                 groups = {k: v for k, v in
                           st.session_state["trait_groups"].items() if v}
@@ -1751,8 +1726,8 @@ def main():
                         for k, v in groups.items()]),
                         use_container_width=True)
                     if st.button("▶ Analyser tous les groupes",
-                                 type="primary", use_container_width=True,
-                                 key="grp_all"):
+                                 type="primary",
+                                 use_container_width=True, key="grp_all"):
                         res = analyze_grp_vs_rest(gu, su, lb, groups,
                                                    q_b, fst_b)
                         st.session_state.group_results = res
@@ -1761,7 +1736,8 @@ def main():
                         summ = [{"Groupe": k,
                                  "Outliers": v["n_snp_outliers"],
                                  "FST moyen": round(v["fst_mean"], 4)}
-                                for k, v in st.session_state.group_results.items()
+                                for k, v in
+                                st.session_state.group_results.items()
                                 if v.get("status") == "success"]
                         if summ:
                             st.dataframe(pd.DataFrame(summ).sort_values(
@@ -1772,20 +1748,23 @@ def main():
                                                 key="grp_det")
                             v = st.session_state.group_results[sel]
                             if v.get("status") == "success":
-                                fig = plt_man(v["all_fst_df"]["FST"].values,
-                                              v["all_fst_df"]["CHR"].values,
-                                              title=f"{sel} vs reste")
-                                if fig: st.plotly_chart(fig,
-                                                        use_container_width=True)
-                                st.dataframe(v["outliers_df"].head(100),
-                                              use_container_width=True)
+                                fig = plt_man(
+                                    v["all_fst_df"]["FST"].values,
+                                    v["all_fst_df"]["CHR"].values,
+                                    title=f"{sel} vs reste")
+                                if fig: st.plotly_chart(
+                                    fig, use_container_width=True)
+                                st.dataframe(
+                                    v["outliers_df"].head(100),
+                                    use_container_width=True)
                                 csv = v["outliers_df"].to_csv(
                                     index=False).encode("utf-8")
                                 st.download_button(f"⬇ {sel}", csv,
                                                     f"grp_{sel}.csv",
-                                                    "text/csv", key="grp_dl")
+                                                    "text/csv",
+                                                    key="grp_dl")
 
-            # Groupe A vs B
+            # --- Groupe A vs B ---
             else:
                 groups = {k: v for k, v in
                           st.session_state["trait_groups"].items() if v}
@@ -1813,7 +1792,8 @@ def main():
                         fig = plt_man(r["all_fst_df"]["FST"].values,
                                       r["all_fst_df"]["CHR"].values,
                                       title=f"{gA} vs {gB}")
-                        if fig: st.plotly_chart(fig, use_container_width=True)
+                        if fig: st.plotly_chart(fig,
+                                                 use_container_width=True)
                         st.dataframe(r["outliers_df"].head(100),
                                       use_container_width=True)
                         csv = r["outliers_df"].to_csv(
@@ -1822,7 +1802,7 @@ def main():
                                             f"diff_{gA}_{gB}.csv",
                                             "text/csv", key="pair_dl")
 
-    # ----- TAB 10 : SNP & Gènes + GWAS -----
+    # ----- TAB 10 : SNP & Gènes -----
     with tabs[10]:
         st.subheader("🧪 SNP & Gènes")
         if not has_qc():
@@ -1838,9 +1818,10 @@ def main():
             s1, s2 = st.tabs(["🧬 Annotation", "📊 GWAS 10 cM"])
 
             with s1:
-                st.markdown("**GTF bovin :** [Ensembl ARS-UCD1.2]"
-                            "(https://ftp.ensembl.org/pub/release-110/"
-                            "gtf/bos_taurus/Bos_taurus.ARS-UCD1.2.110.gtf.gz)")
+                st.markdown(
+                    "**GTF bovin :** [Ensembl ARS-UCD1.2](https://ftp."
+                    "ensembl.org/pub/release-110/gtf/bos_taurus/"
+                    "Bos_taurus.ARS-UCD1.2.110.gtf.gz)")
                 gf = st.file_uploader("GTF", type=["gtf", "gz"],
                                         key="gtf_f")
                 flank = st.slider("Fenêtre (kb)", 10, 5000, 500, 10,
@@ -1854,7 +1835,8 @@ def main():
                             with open(tmp, "wb") as f:
                                 f.write(gf.getbuffer())
                             st.session_state.genes_df = load_gtf(tmp)
-                        st.success(f"✅ {len(st.session_state.genes_df):,} gènes")
+                        st.success(
+                            f"✅ {len(st.session_state.genes_df):,} gènes")
                     except Exception as e:
                         st.error(f"❌ {e}")
                 if st.session_state.genes_df is not None:
@@ -1865,8 +1847,7 @@ def main():
                                             list(res.keys()), key="ann_g")
                         v = res[sel]
                         if v.get("status") == "success":
-                            if st.button("📋 Annoter",
-                                         type="primary",
+                            if st.button("📋 Annoter", type="primary",
                                          use_container_width=True,
                                          key="ann_btn"):
                                 try:
@@ -1875,8 +1856,8 @@ def main():
                                             v["outliers_df"],
                                             st.session_state.genes_df,
                                             int(flank))
-                                        st.session_state.group_results[sel][
-                                            "annotated_df"] = ann
+                                        st.session_state.group_results[
+                                            sel]["annotated_df"] = ann
                                     st.success(f"✅ {len(ann)} SNPs")
                                 except Exception as e:
                                     st.error(f"❌ {e}")
@@ -1906,16 +1887,16 @@ def main():
                 src = st.radio("Source :", ["Groupe de races",
                                              "Fichier CSV"],
                                 horizontal=True, key="gw_src")
-                ph_col = None
-                ph = None
+                ph_col, ph = None, None
                 if src == "Groupe de races":
                     if not groups:
                         st.warning("⚠️ Définissez les groupes.")
                         st.stop()
-                    gn = st.selectbox("Groupe = cas :", list(groups.keys()),
-                                       key="gw_g")
-                    ph = grp_phenotype(iu, groups, gn).rename(
-                        columns={"pheno": "pheno_group"})[["IID", "pheno_group"]]
+                    gn = st.selectbox("Groupe = cas :",
+                                       list(groups.keys()), key="gw_g")
+                    ph = (grp_phenotype(iu, groups, gn)
+                          .rename(columns={"pheno": "pheno_group"})
+                          [["IID", "pheno_group"]])
                     ph_col = "pheno_group"
                     st.success(f"✅ {int(ph['pheno_group'].sum())} cas")
                 else:
@@ -1942,10 +1923,12 @@ def main():
                         sel_g = st.selectbox("Depuis :", avail, key="gw_sg")
                         cands = res[sel_g]["outliers_df"]
                         if not cands.empty:
-                            top_n = st.slider("Top N", 1, 20, 5, key="gw_tn")
+                            top_n = st.slider("Top N", 1, 20, 5,
+                                               key="gw_tn")
                             top = cands.head(top_n)
-                            st.dataframe(top[["CHR", "SNP", "BP", "FST"]],
-                                          use_container_width=True)
+                            st.dataframe(
+                                top[["CHR", "SNP", "BP", "FST"]],
+                                use_container_width=True)
                             win = st.slider("Fenêtre (cM)", 1, 20, 10,
                                             key="gw_w")
                             if st.button("▶ GWAS", type="primary",
@@ -1954,13 +1937,14 @@ def main():
                                 all_g = {}
                                 prog = st.progress(0)
                                 for i, (_, s) in enumerate(top.iterrows()):
-                                    with st.spinner(f"GWAS {s['SNP']}..."):
-                                        r = gwas_local(gu, su, iu, ph,
-                                                       s["CHR"], s["BP"],
-                                                       ph_col, win)
+                                    with st.spinner(
+                                            f"GWAS {s['SNP']}..."):
+                                        r = gwas_local(
+                                            gu, su, iu, ph, s["CHR"],
+                                            s["BP"], ph_col, win)
                                     if not r.empty:
                                         all_g[s["SNP"]] = r
-                                    prog.progress((i + 1) / len(top))
+                                    prog.progress((i+1)/len(top))
                                 st.session_state.gwas_results = all_g
                                 st.success(f"✅ {len(all_g)} GWAS")
 
@@ -1973,15 +1957,19 @@ def main():
                         summ.append({"SNP cible": snp_n,
                                      "N": len(df), "p<0.05": ns,
                                      "Bonferroni": nb,
-                                     "p min": round(df["p_value"].min(), 6)})
-                    st.dataframe(pd.DataFrame(summ), use_container_width=True)
-                    sel = st.selectbox("Voir :", list(gres.keys()), key="gw_v")
+                                     "p min": round(
+                                         df["p_value"].min(), 6)})
+                    st.dataframe(pd.DataFrame(summ),
+                                  use_container_width=True)
+                    sel = st.selectbox("Voir :", list(gres.keys()),
+                                        key="gw_v")
                     df = gres[sel]
                     snp_row = su[su["SNP"] == sel]
                     if not snp_row.empty:
                         fig = plt_gwas(df, snp_row.iloc[0]["CHR"],
                                         int(snp_row.iloc[0]["BP"]))
-                        if fig: st.plotly_chart(fig, use_container_width=True)
+                        if fig: st.plotly_chart(fig,
+                                                 use_container_width=True)
                     st.dataframe(df.head(50), use_container_width=True)
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button(f"⬇ GWAS {sel}", csv,
@@ -2003,22 +1991,23 @@ def main():
                     f = plt_pca(st.session_state.pca_scores,
                                 st.session_state.pca_var,
                                 st.session_state.ind_filt["FID"].values)
-                    figs += f.to_html(full_html=False, include_plotlyjs="cdn")
+                    figs += f.to_html(full_html=False,
+                                       include_plotlyjs="cdn")
                 html = f"""<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><title>Rapport v6.3</title>
+<meta charset="UTF-8"><title>Rapport v6.2</title>
 <style>body{{font-family:Arial;margin:30px}}
 h1{{color:#1a5276;border-bottom:2px solid #1a5276}}
 .summary{{background:#f4f6f7;padding:16px;border-radius:8px}}</style>
-</head><body><h1>🐄 Rapport Bovine SNP Platform v6.3</h1>
+</head><body><h1>🐄 Rapport Bovine SNP Platform v6.2</h1>
 <p><b>{proj}</b> — {datetime.now():%Y-%m-%d %H:%M}</p>
 <div class="summary"><h2>Résumé</h2><ul>
 <li>Individus : {s['n_ind_final']} / {s['n_ind_init']}</li>
 <li>SNPs : {s['n_snp_final']} / {s['n_snp_init']}</li>
 </ul></div>{figs}</body></html>"""
-                st.download_button("⬇ Rapport",
-                                    html.encode("utf-8"),
-                                    f"rapport_{datetime.now():%Y%m%d}.html",
-                                    "text/html", key="rep_dl")
+                st.download_button(
+                    "⬇ Rapport", html.encode("utf-8"),
+                    f"rapport_{datetime.now():%Y%m%d}.html",
+                    "text/html", key="rep_dl")
 
     # ----- PIPELINE COMPLET -----
     if st.session_state.get("_run_pipe"):
@@ -2037,7 +2026,7 @@ h1{{color:#1a5276;border-bottom:2px solid #1a5276}}
                                   "snp_snp"], r):
                     st.session_state[k] = v
                 k = ld_pruning(st.session_state.gt_filt, 50, 5, ld_r2)
-                st.session_state.gt_pruned = st.session_state.gt_filt[:, k]
+                st.session_state.gt_pruned = (st.session_state.gt_filt[:, k])
                 st.session_state.snp_pruned = (
                     st.session_state.snp_filt[k].reset_index(drop=True))
                 gu = st.session_state.gt_pruned
